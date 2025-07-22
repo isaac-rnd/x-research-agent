@@ -9,6 +9,7 @@ on:
 jobs:
   tweet:
     runs-on: ubuntu-latest
+    environment: Running
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
