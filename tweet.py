@@ -1,105 +1,109 @@
-import os
 import sys
+import os
 import logging
-
-import feedparser
 import tweepy
-from transformers import pipeline
+import google.generativeai as genai
+from gnews import GNews
+from dotenv import load_dotenv
 
-# ---- Configuration ----
-RSS_FEED_URL = "http://export.arxiv.org/rss/cs.AI"  # You can change this to any public RSS feed
+load_dotenv()
 
-MAX_TWEET_LENGTH = 280
-
-# Optional: Limit number of articles to process each run
-MAX_POSTS = 1
-
-# ---- Logging setup ----
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-def fetch_latest_entries(feed_url, limit=1):
-    """
-    Fetch latest entries from RSS feed.
-    """
-    logging.info(f"Fetching RSS feed: {feed_url}")
-    feed = feedparser.parse(feed_url)
-    entries = feed.entries[:limit]
-    logging.info(f"Found {len(entries)} entries")
-    return entries
+TWITTER_API_KEY = os.environ.get("TWITTER_API_KEY")
+TWITTER_API_SECRET = os.environ.get("TWITTER_API_SECRET")
+TWITTER_ACCESS_TOKEN = os.environ.get("TWITTER_ACCESS_TOKEN")
+TWITTER_ACCESS_SECRET = os.environ.get("TWITTER_ACCESS_SECRET")
+BEARER_TOKEN = os.environ.get("BEARER_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-def summarize_text(text, model_name="sshleifer/distilbart-cnn-12-6"):
-    """
-    Summarize the provided text using a HuggingFace model.
-    """
-    logging.info("Loading summarization pipeline")
-    summarizer = pipeline("summarization", model=model_name)
-    logging.info("Running summarization")
-    summary = summarizer(text, max_length=60, min_length=20, do_sample=False)[0]['summary_text']
-    return summary.strip()
 
-def format_tweet(title, summary, link):
-    """
-    Format the tweet: Title + TL;DR + link, ensuring <=280 chars.
-    """
-    base = f"{title}\nTL;DR: {summary}\n{link}"
-    if len(base) <= MAX_TWEET_LENGTH:
-        return base
-    # If too long, truncate summary
-    allowed_summary_len = MAX_TWEET_LENGTH - len(title) - len(link) - len("TL;DR: \n\n")
-    truncated_summary = summary[:allowed_summary_len - 3].rstrip() + "..."
-    tweet = f"{title}\nTL;DR: {truncated_summary}\n{link}"
-    if len(tweet) > MAX_TWEET_LENGTH:
-        # As last resort, truncate title too
-        allowed_title_len = MAX_TWEET_LENGTH - len(truncated_summary) - len(link) - len("TL;DR: \n\n")
-        title = title[:allowed_title_len - 3].rstrip() + "..."
-        tweet = f"{title}\nTL;DR: {truncated_summary}\n{link}"
-    return tweet[:MAX_TWEET_LENGTH]
+def get_latest_ai_news():
+    logging.info("Fetching latest AI news from Google News...")
+    try:
+        google_news = GNews(language='en', country='US', period='1d')
+        articles = google_news.get_news('AI technology')
 
-def post_to_twitter(tweet_text):
-    """
-    Post the tweet using Tweepy and Twitter API keys from environment.
-    """
-    api_key = os.environ.get("TWITTER_API_KEY")
-    api_secret = os.environ.get("TWITTER_API_SECRET")
-    access_token = os.environ.get("TWITTER_ACCESS_TOKEN")
-    access_secret = os.environ.get("TWITTER_ACCESS_SECRET")
+        if articles:
+            latest_article = articles[0]
+            logging.info(f"News fetched successfully: '{latest_article['title']}'")
+            return latest_article
+        else:
+            logging.warning("Could not find any recent AI news articles.")
+            return None
+    except Exception as e:
+        logging.error(f"An error occurred during Google News call: {e}")
+        return None
 
-    if not all([api_key, api_secret, access_token, access_secret]):
-        logging.error("Missing Twitter API credentials! Set them as environment variables.")
+
+def summarize_news_for_tweet(news_text: dict) -> str:
+    logging.info("Summarizing news with Gemini...")
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        news_content = f"Title: {news_text['title']}\n\nContent: {news_text.get('content') or news_text.get('description', '')}"
+        article_url = news_text['url']
+
+        prompt = f"""
+        You are an expert AI news analyst. Summarize the following AI news into a
+        concise, engaging, and professional tweet.
+        The tweet MUST be under 280 characters.
+        Include 2-3 relevant and popular hashtags like #AI, #TechNews, #ArtificialIntelligence.
+        Do not include any introductory text like "Here's the summary:".
+        Just provide the tweet text itself.
+
+        Article URL: {article_url}
+
+        News to summarize:
+        ---
+        {news_content}
+        ---
+        """
+        response = model.generate_content(prompt)
+        tweet_text = response.text.strip()
+
+        if len(tweet_text) > 280:
+            logging.warning(f"Gemini generated a tweet longer than 280 characters ({len(tweet_text)}). Truncating.")
+            tweet_text = tweet_text[:277] + "..."
+
+        logging.info("Summary generated successfully.")
+        return tweet_text
+    except Exception as e:
+        logging.error(f"An error occurred during Gemini API call: {e}")
         sys.exit(1)
 
-    logging.info("Authenticating with Twitter API")
-    auth = tweepy.OAuth1UserHandler(api_key, api_secret, access_token, access_secret)
-    api = tweepy.API(auth)
+def post_to_twitter(tweet_text: str):
+    try:
+        client = tweepy.Client(
+            access_token=TWITTER_ACCESS_TOKEN,access_token_secret= TWITTER_ACCESS_SECRET,
+            consumer_key=TWITTER_API_KEY, consumer_secret=TWITTER_API_SECRET, 
+            bearer_token=BEARER_TOKEN
+        )
+        logging.info("Twitter authentication successful.")
+    except tweepy.errors.TweepyException as e:
+        logging.error(f"Error during Twitter authentication: {e}")
+        sys.exit(1)
 
-    logging.info(f"Posting tweet:\n{tweet_text}")
-    api.update_status(tweet_text)
-    logging.info("Tweet posted successfully.")
+    print("Starting to send the tweet")
+    try:
+        response = client.create_tweet(text=tweet_text)
+        print("Tweet posted successfully.")
+        logging.info(f"Tweet ID: {response.data['id']}")
+    except tweepy.errors.TweepyException as e:
+        logging.error(f"Error posting tweet: {e}")
+        sys.exit(1)
 
 def main():
-    entries = fetch_latest_entries(RSS_FEED_URL, limit=MAX_POSTS)
-    for entry in entries:
-        title = entry.title.strip()
-        # Prefer summary, fall back to description or content
-        content = getattr(entry, "summary", None) or getattr(entry, "description", None) or ""
-        link = entry.link
-
-        if not content:
-            logging.warning("No summary/content found for entry. Skipping.")
-            continue
-
-        summary = summarize_text(content)
-        tweet_text = format_tweet(title, summary, link)
-
-        if len(tweet_text) > MAX_TWEET_LENGTH:
-            logging.warning("Tweet too long even after truncation, skipping.")
-            continue
-
-        post_to_twitter(tweet_text)
+    news_article = get_latest_ai_news()
+    print(news_article)
+    tweet_content = summarize_news_for_tweet(news_article)
+    print(tweet_content)
+    if tweet_content:
+        post_to_twitter(tweet_content)
 
 if __name__ == "__main__":
     main()
